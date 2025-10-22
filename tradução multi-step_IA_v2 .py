@@ -41,42 +41,102 @@ def append_log(path, obj):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 # --------------------------
-# Prompts (refine & qa)
+# PROMPT BUILDERS
 # --------------------------
+
 def build_refine_prompt(original, google, target_language):
+    """Creates a prompt for refinement step."""
     return f"""
-You are a language expert specializing in translating RPG/game content.
-Refine the Google translation so it is natural, accurate, and contextually appropriate for in-game text.
+You are a language expert specializing in translating RPG and game content.
+Refine the Google translation so it sounds natural, accurate, and contextually appropriate
+for in-game dialogues or UI text.
 
 Target Language: {target_language}
 
 Original Text:
-{original}
+{original.strip()}
 
 Google Translation:
-{google}
+{google.strip()}
 
-Provide only the improved translation (single line or paragraph). No extra commentary.
+Provide only the improved translation (single line or paragraph). 
+No explanations, comments, or formatting tags.
 """
+
 
 def build_qa_prompt(original, refined, target_language):
+    """Creates a QA prompt to verify correctness of the translation."""
     return f"""
-You are a language expert reviewing RPG/game translations.
+You are a linguistic QA expert evaluating translations for RPG/game text.
+
 Original Text:
-{original}
+{original.strip()}
 
 Refined Translation:
-{refined}
+{refined.strip()}
 
-Is the refined translation faithful, natural and suitable for an RPG context?
-Reply with exactly "OK" if it's fine.
-Otherwise reply ONLY with a corrected translation (no explanations or metadata).
+Check if the refined translation is accurate, natural, and suitable for the game context.
+
+If correct, reply with exactly: OK
+If not, reply ONLY with the corrected translation (no extra commentary).
 """
+
+
+def koboldCPP_call(prompt, model=None, system_prompt=None, max_tokens=256, temperature=0.2):
+    """
+    Sends an instruct-style prompt to a running KoboldCPP instance using
+    the correct <|begin_of_text|> chat template format for Llama/Gemma instruct GGUF models.
+    """
+
+    KOBOLDCPP_PORT = 5001  # adjust if needed
+    url = f"http://localhost:{KOBOLDCPP_PORT}/api/v1/generate"
+
+    # --- Build proper instruct-format prompt ---
+    chat_formatted = (
+        "<|begin_of_text|>"
+        "<|start_header_id|>system<|end_header_id|>\n\n"
+        "Cutting Knowledge Date: December 2023\n"
+        "Today Date: 25 Oct 2024\n\n"
+        f"{system_prompt or 'You are a helpful AI assistant focused on accurate language translation.'}"
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{prompt.strip()}"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+    payload = {
+        "prompt": chat_formatted,
+        "max_context_length": 4096,
+        "max_length": max_tokens,
+        "temperature": temperature,
+        "top_p": 0.9,
+        "top_k": 40,
+        "rep_pen": 1.1,
+        "stop_sequence": [
+            "<|eot_id|>",
+            "<|start_header_id|>user<|end_header_id|>",
+            "<|start_header_id|>system<|end_header_id|>",
+        ],
+        "quiet": True,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=180)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("results") and data["results"][0].get("text"):
+            return data["results"][0]["text"].strip()
+        else:
+            return "[No output received from model]"
+
+    except Exception as e:
+        return f"[KoboldCPP error: {e}]"
+
 
 # --------------------------
 # Llama-server wrappers
 # --------------------------
-def llama_call(prompt, model, max_tokens=256, temperature=0.2):
+def llamacpp_call(prompt, model, max_tokens=256, temperature=0.2):
     url = f"http://localhost:{LLAMA_SERVER_PORT}/v1/chat/completions"
     payload = {
         "model": model,
@@ -93,6 +153,7 @@ def llama_call(prompt, model, max_tokens=256, temperature=0.2):
     except Exception:
         # fallback: entire json
         return json.dumps(j, ensure_ascii=False)
+    
 
 # --------------------------
 # Step 1: Google Translate
@@ -144,7 +205,7 @@ def process_refine_file(google_cache_path, refined_cache_path, translation_model
                 continue
             prompt = build_refine_prompt(original, google_trans, lang)
             try:
-                refined = llama_call(prompt, translation_model)
+                refined = koboldCPP_call(prompt, translation_model)
             except Exception as e:
                 refined = f"[Llama refine ERROR: {e}]"
             refined_cache[key].setdefault(lang, {})
@@ -183,7 +244,7 @@ def process_qa_file(refined_cache_path, qa_cache_path, translation_model, qa_mod
             # call QA-check model
             prompt = build_qa_prompt(entry.get("original", ""), refined, lang)
             try:
-                qa_out = llama_call(prompt, qa_model, max_tokens=256)
+                qa_out = koboldCPP_call(prompt, qa_model, max_tokens=256)
             except Exception as e:
                 qa_out = f"[Llama QA ERROR: {e}]"
 
@@ -228,10 +289,10 @@ def process_qa_file(refined_cache_path, qa_cache_path, translation_model, qa_mod
                         save_json(refined_cache_path, refined_cache)
                         save_json(qa_cache_path, qa_cache)
                         # recursively call QA for this single key/lang (careful with recursion depth; but attempts limited)
-                        # We will call llama_call again with updated refined text
+                        # We will call koboldCPP_call again with updated refined text
                         prompt2 = build_qa_prompt(entry.get("original", ""), corrected, lang)
                         try:
-                            qa_out2 = llama_call(prompt2, qa_model, max_tokens=256)
+                            qa_out2 = koboldCPP_call(prompt2, qa_model, max_tokens=256)
                         except Exception as e:
                             qa_out2 = f"[Llama QA ERROR: {e}]"
                         if qa_out2.strip().upper() == "OK":
